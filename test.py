@@ -45,6 +45,8 @@ class LOB:
         self.event_n = 0
 
     def fit_snapshot(self, j: "json"):
+        self.reset_lob_detail()
+
         data = j.get('data')
         seq = j.get('cross_seq')
         ts = j.get('timestamp_e6')
@@ -95,7 +97,10 @@ class LOB:
                     logger.debug("record exists")
 
     def save(self):
-        np.savetxt('./lob_detail.csv', self.lob_detail, delimiter=',', fmt='%s')
+        np.savetxt('./lob_detail.csv', self.lob_detail[1:, :], delimiter=',', fmt='%s')
+
+    def reset_lob_detail(self):
+        self.lob_detail = np.empty([1, 18])
 
 
 class Util:
