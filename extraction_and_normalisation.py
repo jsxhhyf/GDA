@@ -1,15 +1,22 @@
 import json
+import pprint
 import sys
 import threading
 import time
 
 import numpy as np
+import pandas as pd
 import websocket
 from loguru import logger
 
 logger.remove()
-logger.add(sys.stderr,
-           format='<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function:<20}</cyan>:<cyan>{line:<3}</cyan> | <cyan>{thread.name}</cyan> - <level>{message}</level>')
+std_logger = logger.add(sys.stderr,
+                        format='<green>{time:HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{'
+                               'name}</cyan>:<cyan>{function:<20}</cyan>:<cyan>{line:<3}</cyan> | <cyan>{'
+                               'thread.name}</cyan> - <level>{message}</level>',
+                        level='INFO')
+
+pp = pprint.PrettyPrinter(indent=4, width=80, compact=False)
 
 
 class WebsocketHandler:
@@ -119,24 +126,27 @@ class LOB:
         self.market_order_book = None
 
     def on_snapshot(self, j: "json"):
-        self.debug_on_receive('snapshot', j)
+
         self.reset_lob_event()
+        self.debug_on_receive('snapshot', j)
 
         _snap_array = []
 
-        data = j.get('data')
-        ts = j.get('timestamp_e6') // 1000
+        data = j['data']
+        ts = j['timestamp_e6'] // 1e3
 
         for record in data:
-            temp = [self.get_event_no(), record.get('id'), Util.d_buy_sell[record.get('side')], record.get('price'),
-                    record.get('size'), np.nan, ts, Util.d_order_type['limit_orders'], np.nan, np.nan, np.nan, np.nan,
+            temp = [self.get_event_no(), record['id'], Util.d_buy_sell[record['side']], record['price'],
+                    record['size'], np.nan, ts, Util.d_order_type['limit_orders'], np.nan, np.nan, np.nan, np.nan,
                     np.nan, np.nan]
             _snap_array.append(temp)
 
             # create a dict of price, side, and size
-            self.lob_general[record.get('price')] = [record.get('size'), record.get('side')]
+            self.lob_general[record['price']] = [record['size'], record['side']]
 
         self.lob_event = np.array(_snap_array)
+
+        self.display_lob_general()
 
     def on_delta(self, j: json):
         self.debug_on_receive('delta', j)
@@ -150,43 +160,28 @@ class LOB:
 
         if self.delta_cache:
 
-            for delta in self.delta_cache:
+            for idx, delta in enumerate(self.delta_cache):
 
-                # for delete data
-                delta_delete = delta['data']['delete']
+                logger.debug('Process {}th delta in cache...', idx)
 
-                if delta_delete:
+                for action in ['delete', 'update', 'insert']:
 
-                    logger.debug('DELETE delta detected!')
+                    deltas = delta['data'][action]
 
-                    for delta_record in delta_delete:
-                        trades = [t for t in self.trade['data'] if float(delta_record['price']) == float(t['price'])]
+                    if deltas:
 
-                        ready_event_list.append(self.handle_delete(delta_record, trades))
+                        logger.debug('{} delta detected!', action.upper())
 
-                # for update data
-                delta_update = delta['data']['update']
+                        for delta_record in deltas:
+                            if self.trade:
+                                logger.debug('Using trade data @ {}', self.get_timestamp('trade', self.trade))
+                                trades = [t for t in self.trade['data'] if
+                                          float(delta_record['price']) == float(t['price'])]
+                            else:
+                                trades = None
 
-                if delta_update:
-
-                    logger.debug('UPDATE delta detected!')
-
-                    for delta_record in delta['data']['update']:
-                        trades = [t for t in self.trade['data'] if float(delta_record['price']) == float(t['price'])]
-
-                        ready_event_list.append(self.handle_update(delta_record, trades))
-
-                # for insert data
-                delta_insert = delta['data']['insert']
-
-                if delta_insert:
-
-                    logger.debug('INSERT delta detected!')
-
-                    for delta_record in delta.get('data').get('insert'):
-                        trades = [t for t in self.trade if float(delta['price']) == float(t['price'])]
-
-                        ready_event_list.append(self.handle_insert(delta_record, trades))
+                            ready_event_list.append(
+                                self.handle_delta(action, delta_record, delta['timestamp_e6'], trades))
 
         else:
             logger.debug('trade arrives earlier than delta')
@@ -194,13 +189,12 @@ class LOB:
         ready_event_ndarray = np.array(ready_event_list)
         self.lob_event = np.append(self.lob_event, ready_event_ndarray, axis=0)
 
-        ## for market order book
+        # for market order book
 
         trades_temp_list = []
-        # logger.debug(self.trade)
+
         for t in self.trade:
-            temp = [int(float(t.get('price')) * 1e5), t.get('price'), t.get('trade_id'), t.get('trade_time_ms'),
-                    t.get('side'), t.get('size')]
+            temp = [int(float(t['price']) * 1e5), t['price'], t['trade_id'], t['trade_time_ms'], t['side'], t['size']]
             trades_temp_list.append(temp)
 
             # logger.debug(np.array(trades_temp_list).shape)
@@ -215,24 +209,36 @@ class LOB:
 
         self.trade = j
 
-    def handle_delete(self, delta: 'json', trades: list = None):
+    def handle_delta(self, action: str, delta: 'json', ts: int, trades: list = None):
 
         event_list = []
 
         temp = [self.get_event_no(), delta['id'], Util.d_buy_sell[delta['side']], delta['price'],
-                self.lob_general[delta['price']][0], 3, int(delta['timestamp_e6'] // 1e3), 1, 1, 0, np.nan, np.nan,
-                np.nan, np.nan]
+                self.lob_general[delta['price']][0] if action == 'delete' else delta['size'], Util.d_action[action], ts,
+                1, 0 if action == 'insert' else 1, 0, np.nan, np.nan, np.nan, np.nan]
 
         if trades:
 
-            logger.debug('found trades for delete {} @ {}', delta['price'], delta['timestamp_e6'])
+            logger.debug('found trades for {} {} @ {}', action, delta['price'], ts)
             logger.debug('delta_record: {}', delta)
             logger.debug('trade found: {}', trades)
+
+            if action == 'insert':
+                self.lob_general[delta['price']] = [temp[Util.d_column_index['size']],
+                                                    temp[Util.d_column_index['side']]]
 
             for t in trades:
 
                 if t['side'] != delta['side']:
-                    temp[Util.d_column_index['size']] -= t['size']
+
+                    size_change = delta['size']
+                    if action == 'update':
+                        size_change -= self.lob_general[delta['price']][0]
+                        size_change += t['size']
+                    elif action == 'delete':
+                        temp[Util.d_column_index['size']] -= t['size']
+                    elif action == 'insert':
+                        temp[Util.d_column_index['size']] += t['size']
 
                     # generated market order
                     temp_market = [
@@ -272,167 +278,26 @@ class LOB:
                     ]
                     event_list.append(temp_limit)
                 else:
-                    logger.warning('SAME SIDE DETECTED IN DELETE DELTA!')
+                    logger.warning('SAME SIDE DETECTED IN {} DELTA!', action.upper())
                     logger.debug('trade: {}', t)
                     logger.debug('delta: {}', delta)
 
                 event_list.append(temp)
 
         else:
-            logger.debug('No matching trade found for delete {} @ {}', delta['price'], delta['timestamp_e6'])
+            logger.debug('No matching trade found for {} {} from size {} to {} @ {}', action.upper(), delta['price'],
+                         self.lob_general[delta['price']][0] if action != 'insert' else 0,
+                         delta['size'] if action != 'delete' else 0, ts % 1e8)
 
         # sync lob_general
-        self.lob_general[delta['price']][0] = 0
+        if action == 'delete':
+            self.lob_general[delta['price']][0] = 0
+            logger.debug('LOG_GENERAL: DELETE {}', delta['price'])
+        elif action == 'update':
+            self.lob_general[delta['price']][0] = delta['size']
+            logger.debug('LOG_GENERAL: UPDATE {}', delta['price'])
 
         return event_list
-
-    def handle_update(self, delta: 'json', trades: list = None):
-        event_list = []
-
-        temp = [self.get_event_no(), delta['id'], Util.d_buy_sell[delta['side']], delta['price'],
-                self.lob_general[delta['price']][0], 4, int(delta['timestamp_e6'] // 1e3), 1, 1, 0, np.nan, np.nan,
-                np.nan, np.nan]
-
-        if trades:
-
-            logger.debug('found trades for update {} @ {}', delta['price'], delta['timestamp_e6'])
-            logger.debug('delta_record: {}', delta)
-            logger.debug('trade found: {}', trades)
-
-            for t in trades:
-
-                size_change = delta['size']
-                size_change -= self.lob_general[delta['price']][0]
-
-                if t['side'] != delta['side']:
-
-                    size_change += t.get('size')
-
-                    # generated market order
-                    temp_market = [
-                        self.get_event_no(),  # event_no
-                        temp[Util.d_column_index['order_id']],  # order_id
-                        Util.d_buy_sell[t['side']],  # side
-                        temp[Util.d_column_index['price']],  # price
-                        t['size'],  # size
-                        1,  # lob_action
-                        t['trade_time_ms'],  # event_ts
-                        Util.d_order_type['market_orders'],  # order_type
-                        0,  # order_cancelled
-                        1,  # order_executed
-                        temp[Util.d_column_index['price']],  # execution_price
-                        t['size'],  # execution_size
-                        Util.d_buy_sell[t['side']],  # agressor_side
-                        t['trade_id']  # trade_id
-                    ]
-                    event_list.append(temp_market)
-
-                    # corresponding limit order
-                    temp_limit = [
-                        self.get_event_no(),  # event_no
-                        temp[Util.d_column_index['order_id']],  # order_id
-                        3 - Util.d_buy_sell[t['side']],  # side
-                        temp[Util.d_column_index['price']],  # price
-                        t['size'],  # size
-                        1,  # lob_action
-                        t['trade_time_ms'],  # event_ts
-                        Util.d_order_type['limit_orders'],  # order_type
-                        0,  # order_cancelled
-                        1,  # order_executed
-                        temp[Util.d_column_index['price']],  # execution_price
-                        t['size'],  # execution_size
-                        Util.d_buy_sell[t['side']],  # agressor_side
-                        t['trade_id']  # trade_id
-                    ]
-                    event_list.append(temp_limit)
-                else:
-                    logger.warning('SAME SIDE DETECTED IN UPDATE DELTA!')
-                    logger.debug('trade: {}', t)
-                    logger.debug('delta: {}', delta)
-
-                temp[Util.d_column_index['size']] = np.abs(size_change)
-                event_list.append(temp)
-
-        else:
-            logger.debug('No matching trade found for update {} @ {}', delta['price'], delta['timestamp_e6'])
-
-        # sync lob_general
-        self.lob_general[delta['price']][0] = delta['size']
-
-        return event_list
-
-    def handle_insert(self, delta: 'json', trades: list = None):
-
-        event_list = []
-
-        temp = [self.get_event_no(), delta['id'], Util.d_buy_sell[delta['side']], delta['price'],
-                self.lob_general[delta['price']][0], 2, int(delta['timestamp_e6'] // 1e3), 1, 0, 0, np.nan, np.nan,
-                np.nan, np.nan]
-
-        if trades:
-
-            logger.debug('found trades for insert {} @ {}', delta['price'], delta['timestamp_e6'])
-            logger.debug('delta_record: {}', delta)
-            logger.debug('trade found: {}', trades)
-
-            # sync lob_general
-            self.lob_general[delta['price']] = [temp[Util.d_column_index['size']],
-                                                           temp[Util.d_column_index['side']]]
-
-            for t in trades:
-
-                if t['side'] != delta['side']:
-                    temp[Util.d_column_index['size']] += t['size']
-
-                    # generated market order
-                    temp_market = [
-                        self.get_event_no(),  # event_no
-                        temp[Util.d_column_index['order_id']],  # order_id
-                        Util.d_buy_sell[t['side']],  # side
-                        temp[Util.d_column_index['price']],  # price
-                        t['size'],  # size
-                        1,  # lob_action
-                        t['trade_time_ms'],  # event_ts
-                        Util.d_order_type['market_orders'],  # order_type
-                        0,  # order_cancelled
-                        1,  # order_executed
-                        temp[Util.d_column_index['price']],  # execution_price
-                        t['size'],  # execution_size
-                        Util.d_buy_sell[t['side']],  # agressor_side
-                        t['trade_id']  # trade_id
-                    ]
-                    event_list.append(temp_market)
-
-                    # corresponding limit order
-                    temp_limit = [
-                        self.get_event_no(),  # event_no
-                        temp[Util.d_column_index['order_id']],  # order_id
-                        3 - Util.d_buy_sell[t['side']],  # side
-                        temp[Util.d_column_index['price']],  # price
-                        t['size'],  # size
-                        1,  # lob_action
-                        t['trade_time_ms'],  # event_ts
-                        Util.d_order_type['limit_orders'],  # order_type
-                        0,  # order_cancelled
-                        1,  # order_executed
-                        temp[Util.d_column_index['price']],  # execution_price
-                        t['size'],  # execution_size
-                        Util.d_buy_sell[t['side']],  # agressor_side
-                        t['trade_id']  # trade_id
-                    ]
-                    event_list.append(temp_limit)
-                else:
-                    logger.warning('SAME SIDE DETECTED IN DELETE DELTA!')
-                    logger.debug('trade: {}', t)
-                    logger.debug('delta: {}', delta)
-
-                event_list.append(temp)
-
-        else:
-            logger.debug('No matching trade found for delete {} @ {}', delta['price'], delta['timestamp_e6'])
-
-        return event_list
-
 
     def cache_delta(self, delta: 'json'):
         logger.debug('Adding to delta_cache ... ')
@@ -444,6 +309,7 @@ class LOB:
         self.delta_cache.clear()
 
     def save(self):
+        logger.debug('Start writing to csv files...')
         np.savetxt('./lob_events.csv', self.lob_event, delimiter=',', fmt='%s')
         np.savetxt('./market_order_book.csv', self.market_order_book, delimiter=',', fmt='%s')
         logger.debug(self.market_order_book.shape)
@@ -451,21 +317,35 @@ class LOB:
     def reset_lob_event(self):
         self.lob_event = np.empty([1, 18])
 
-    def get_timestamp(self, t: str, j: 'json') -> list:
+    def get_timestamp(self, message_type: str, j: 'json') -> list:
 
         ts_list = []
 
-        if t == 'trade':
+        if message_type == 'trade':
             for data in j['data']:
-                ts_list.append(data['trade_time_ms'])
+                ts_list.append(data['trade_time_ms'] % 1e8)
 
-        elif t == 'delta' or t == 'snapshot':
-            ts_list.append(int(j['timestamp_e6'] // 1e3))
+        elif message_type == 'delta' or message_type == 'snapshot':
+            ts_list.append(int(j['timestamp_e6'] // 1e3 % 1e8))
 
         return ts_list
 
     def debug_on_receive(self, t: str, j: 'json'):
         logger.debug('{:<10s} packet received! ts: {}', t.upper(), self.get_timestamp(t, j))
+        # if t == 'delta':
+        #     logger.debug('Price: {}, Side: {}', j['data'])
+
+    def display_lob_general(self):
+
+        # sort lob by price
+        sorted_lob = dict(sorted(self.lob_general.items(), key=lambda d: d[0]))
+
+        lob_df = pd.DataFrame({'price': sorted_lob.keys()})
+        lob_df['size'] = [item[0] for item in sorted_lob.values()]
+        lob_df['side'] = [item[1] for item in sorted_lob.values()]
+        # print(lob_df)
+
+        lob_df.to_csv('./lob_general.csv')
 
     @staticmethod
     def get_event_no():
@@ -476,7 +356,7 @@ class LOB:
 
 class Util:
     d_buy_sell = {'Unkonwn': 0, 'Buy': 1, 'Sell': 2, }
-    d_action = {'unknown': 0, 'skip': 1, 'insert': 2, 'remove': 3, 'update': 4}
+    d_action = {'unknown': 0, 'skip': 1, 'insert': 2, 'delete': 3, 'update': 4}
     d_order_type = {'unknown': 0, 'limit_orders': 1, 'market_orders': 2}
     d_column_index = {
         "event_no": 0,
